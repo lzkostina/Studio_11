@@ -26,18 +26,29 @@ class GaussianMixtureModelVectorized:
         self.log_likelihoods_ = []
         self.converged_ = False
         self.n_iter_ = 0
+    def _set_parameters(self, mus, covs, pi):
+        """Set model parameters (for compatibility with original class)."""
+        self.mu_ = np.array(mus)
+        self.cov_ = np.array(covs)
+        self.pi_ = np.array(pi)
 
     # Initialization
-    def _initialize_parameters(self, X):
+    def _initialize_parameters(self, X, theta=None):
         rng = np.random.default_rng(self.random_state)
-        n_samples, n_features = X.shape
 
+        if theta is not None:
+            self._set_parameters(*theta)
+            return
+
+        n_samples, n_features = X.shape
         indices = rng.choice(n_samples, self.n_components, replace=False)
         self.mu_ = X[indices].copy()
         self.cov_ = np.array([np.eye(n_features) for _ in range(self.n_components)])
         self.pi_ = np.ones(self.n_components) / self.n_components
 
-    # E-step (vectorized)
+
+    '''
+        # E-step (vectorized)
     def _e_step(self, X):
         n_samples = X.shape[0]
         probs = np.zeros((n_samples, self.n_components))
@@ -51,6 +62,33 @@ class GaussianMixtureModelVectorized:
         probs = np.divide(probs, row_sums, where=row_sums > 0)
         probs[row_sums.squeeze() == 0] = 1.0 / self.n_components
         return probs
+    '''
+
+    
+    def _e_step(self, X):
+        """E-step: numerically stable computation of responsibilities."""
+        n_samples, n_features = X.shape
+        log_prob = np.zeros((n_samples, self.n_components))
+
+        # log(π_k * N(x_i | μ_k, Σ_k)) = log π_k + log pdf
+        for k in range(self.n_components):
+            log_prob[:, k] = (
+                np.log(self.pi_[k] + 1e-32)
+                + multivariate_normal.logpdf(X, mean=self.mu_[k], cov=self.cov_[k])
+            )
+
+        # Use log-sum-exp trick to normalize in log-space
+        max_log = np.max(log_prob, axis=1, keepdims=True)
+        log_sum_exp = max_log + np.log(
+            np.sum(np.exp(log_prob - max_log), axis=1, keepdims=True)
+        )
+
+        # Responsibilities: r_ik = exp(log π_k N / log-sum-exp)
+        log_resp = log_prob - log_sum_exp
+        responsibilities = np.exp(log_resp)
+
+        return responsibilities
+
 
     # M-step (vectorized)
     def _m_step(self, X, responsibilities):
@@ -71,22 +109,41 @@ class GaussianMixtureModelVectorized:
 
         # Update mixing weights
         self.pi_ = N_k / n_samples
-
-    # Log-likelihood (vectorized)
+    '''
+        # Log-likelihood (vectorized)
     def _compute_log_likelihood(self, X):
         n_samples = X.shape[0]
         pdfs = np.zeros((n_samples, self.n_components))
         for k in range(self.n_components):
             pdfs[:, k] = self.pi_[k] * multivariate_normal.pdf(X, mean=self.mu_[k], cov=self.cov_[k])
         return np.sum(np.log(pdfs.sum(axis=1) + 1e-12))
+    '''
+
+    
+    def _compute_log_likelihood(self, X):
+        """Compute total log-likelihood using log-sum-exp for stability."""
+        n_samples = X.shape[0]
+        log_prob = np.zeros((n_samples, self.n_components))
+
+        for k in range(self.n_components):
+            log_prob[:, k] = (
+                np.log(self.pi_[k] + 1e-32)
+                + multivariate_normal.logpdf(X, mean=self.mu_[k], cov=self.cov_[k])
+            )
+
+        # Apply log-sum-exp across components
+        max_log = np.max(log_prob, axis=1, keepdims=True)
+        log_sum_exp = max_log + np.log(np.sum(np.exp(log_prob - max_log), axis=1, keepdims=True))
+
+        return np.sum(log_sum_exp)
 
     # Fit EM algorithm
-    def fit(self, X, max_iter=500, tol=1e-6, verbose=True, initial_theta=None):
+    def fit(self, X, max_iter=500, tol=1e-6, initial_theta=None, verbose=True):
         X = np.asarray(X)
 
         # Initialize parameters
         if initial_theta is not None:
-            self.mu_, self.cov_, self.pi_ = initial_theta
+            self._set_parameters(*initial_theta)
         else:
             self._initialize_parameters(X)
 
