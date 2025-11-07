@@ -1,7 +1,6 @@
 import numpy as np
-from scipy.stats import multivariate_normal
 from scipy.special import logsumexp
-from scipy.linalg import cholesky, solve_triangular
+from scipy.linalg import cholesky
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
@@ -54,7 +53,10 @@ class GaussianMixtureModelVectorized:
         self.log_likelihoods_ = None
         self.n_iter_ = None
         self.converged_ = False
+
+        # add regularization
         self.reg_ = 1e-6
+
 
     def fit(self, X, max_iter=500, tol=1e-6, initial_theta=None, verbose=True):
         """
@@ -78,13 +80,9 @@ class GaussianMixtureModelVectorized:
         self.max_iter = max_iter
         self.tol = tol
 
-        X = np.asarray(X)
-        n_samples, n_features = X.shape
-
-        # Initialize parameters
+        X = np.asarray(X, dtype=np.float64)
         self._initialize_parameters(X, initial_theta)
 
-        # Track log-likelihood
         self.log_likelihoods_ = []
 
         # Main EM loop
@@ -110,6 +108,7 @@ class GaussianMixtureModelVectorized:
             self.n_iter_ = self.max_iter
 
         return self
+
 
     def _set_parameters(self, mus, covs, pi):
         # Convert to numpy arrays for vectorized operations
@@ -190,10 +189,10 @@ class GaussianMixtureModelVectorized:
         # Using Y = (X - μ_k) @ precision_chol, then ||Y||^2
         # diff: (n_samples, n_components, n_features)
         # precisions_chol_: (n_components, n_features, n_features)
-        Y = np.einsum('nkd,kde->nke', diff, self.precisions_chol_)
+        Y = np.einsum('nkd,kde->nke', diff, self.precisions_chol_, optimize= True)
 
         # Mahalanobis distance squared: ||Y||^2 for each sample and component
-        maha_sq = np.einsum('nke,nke->nk', Y, Y)
+        maha_sq = np.einsum('nke,nke->nk', Y, Y, optimize=True)
 
         # log N(x | μ, Σ) = -0.5 * [d*log(2π) + log|Σ| + (x-μ)^T Σ^(-1) (x-μ)]
         # log|Σ| = -2 * log|precision_chol|
@@ -230,41 +229,46 @@ class GaussianMixtureModelVectorized:
         log_responsibilities = log_weighted - log_sum
         responsibilities = np.exp(log_responsibilities)
 
-        # Ensure responsibilities are valid probabilities (handle numerical issues)
-        responsibilities = np.clip(responsibilities, 0, 1)
-        row_sums = responsibilities.sum(axis=1, keepdims=True)
-        mask = row_sums.flatten() == 0
-        responsibilities = np.where(
-            mask[:, np.newaxis],
-            1.0 / self.n_components,
-            responsibilities / row_sums
-        )
-
         return responsibilities
 
 
     def _m_step(self, X, R):
-        X = np.asarray(X, dtype=float)
+        X = np.asarray(X, dtype=np.float64)
         n, d = X.shape
         K = self.n_components
 
         Nk = R.sum(axis=0)  # (K,)
         Nk_safe = np.maximum(Nk, 1e-12)
 
-        self.pi_ = Nk / n  # (K,)
-        self.mu_ = (R.T @ X) / Nk_safe[:, None]  # (K,d)
+        # mixing weights and means
+        self.pi_ = Nk / n
+        #self.mu_ = (R.T @ X) / Nk_safe[:, None]  # (K,d)
+        np.dot(R.T, X, out=self.mu_)
+        self.mu_ /= Nk_safe[:, None]
 
-        # Σ_k = (∑ r_ik (x_i - μ_k)(x_i - μ_k)^T) / N_k
-        diff = X[:, None, :] - self.mu_[None, :, :]  # (n,K,d)
-        w = R[:, :, None]  # (n,K,1)
-        cov = np.einsum('nkd,nke->kde', w * diff, diff) / Nk_safe[:, None, None]  # (K,d,d)
 
-        # symmetrize + ridge for SPD
-        cov = 0.5 * (cov + np.transpose(cov, (0, 2, 1)))
-        cov += self.reg_ * np.eye(d)[None, :, :]
+        cov = np.empty((K, d, d), dtype=X.dtype)
+        XT = X.T
+        I = np.eye(d, dtype=X.dtype)
+
+        # reuse a work buffer for wX to avoid re-allocating each loop
+        wX = np.empty_like(X)
+        for k in range(K):
+            # wX = diag(r_k) @ X  (row-scaling)
+            np.multiply(X, R[:, [k]], out=wX)  # (n,d)
+
+            # second moment: X^T W_k X
+            G = XT @ wX  # (d,d), BLAS GEMM
+
+            # covariance = E[xx^T] - mu mu^T
+            S = (G / Nk_safe[k]) - np.outer(self.mu_[k], self.mu_[k])
+
+            # symmetrize + ridge (SPD)
+            S = 0.5 * (S + S.T) + self.reg_ * I
+            cov[k] = S
 
         self.cov_ = cov
-        self._compute_precisions_cholesky()  # refresh caches
+        self._compute_precisions_cholesky()
 
     def _compute_log_likelihood(self, X):
         """
@@ -274,17 +278,14 @@ class GaussianMixtureModelVectorized:
         -------
         log_likelihood : float
         """
-        # Compute log probabilities: log N(x_i | μ_k, Σ_k)
+        # log probabilities
         log_prob = self._log_multivariate_normal_density(X)
-
-        # Add log mixing proportions: log π_k + log N(x_i | μ_k, Σ_k)
         log_weighted = log_prob + np.log(self.pi_ + 1e-300)[None, :]
 
-        # Use log-sum-exp to compute log(Σ_k π_k * N(x_i | μ_k, Σ_k))
-        # This gives us log p(x_i) for each sample i
+        # log p(x_i) for each i
         log_point_likelihoods = logsumexp(log_weighted, axis=1)
 
-        # Sum over all samples to get total log-likelihood
+        # total log-likelihood
         log_likelihood = log_point_likelihoods.sum()
 
         return log_likelihood
@@ -302,7 +303,7 @@ class GaussianMixtureModelVectorized:
         responsibilities : array, shape (n_samples, n_components)
             Posterior probabilities
         """
-        X = np.asarray(X)
+        X = np.asarray(X, dtype=np.float64)
         return self._e_step(X)
 
     def predict(self, X):
@@ -333,7 +334,7 @@ class GaussianMixtureModelVectorized:
         -------
         log_likelihood : float
         """
-        X = np.asarray(X)
+        X = np.asarray(X, dtype=np.float64)
         return self._compute_log_likelihood(X)
 
 
