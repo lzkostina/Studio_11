@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.stats import multivariate_normal
 from tqdm import tqdm
+from scipy.linalg import cholesky, solve_triangular
+from scipy.special import logsumexp
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
@@ -214,18 +216,19 @@ class GaussianMixtureModel:
             cov_new,
             pi_new
         )
+
     
     def _compute_log_likelihood(self, X):
         """
         Compute the log-likelihood of the data.
-        
+
         Returns
         -------
         log_likelihood : float
         """
         n_samples = X.shape[0]
         log_likelihood = 0.0
-        
+
         for i in range(n_samples):
             # Compute p(x_i) = Σ_k π_k * N(x_i | μ_k, Σ_k)
             point_likelihood = 0.0
@@ -235,10 +238,10 @@ class GaussianMixtureModel:
                     point_likelihood += self.pi_[k] * pdf_value
                 except np.linalg.LinAlgError:
                     pass
-            
+
             # Add log(p(x_i)) to total
-            log_likelihood += np.log(point_likelihood)
-        
+            log_likelihood += np.log(point_likelihood + 1e-300)
+
         return log_likelihood
     
     def predict_proba(self, X):
